@@ -384,8 +384,12 @@ async function runAlertScan() {
   }
 }
 
-// Run every 5 minutes
-setInterval(runAlertScan, 5 * 60 * 1000);
+// --- Scheduler: run every 60 minutes ---
 
-// Also run once shortly after boot
-setTimeout(runAlertScan, 30 * 1000);
+const SCAN_INTERVAL_MINUTES = 60;
+
+// Run every 60 minutes
+setInterval(runAlertScan, SCAN_INTERVAL_MINUTES * 60 * 1000);
+
+// Also run once shortly after boot (give it ~60s to receive configs)
+setTimeout(runAlertScan, 60 * 1000);
