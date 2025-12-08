@@ -132,8 +132,12 @@ app.get('/', (req, res) => {
  * (For safety we ALSO accept the older shape:
  *  { symbol, alertWithinPct, tiersUSD: [ ... ] } )
  */
-app.post(['/alert-config', '/api/alert-config'], (req, res) => {
+// Accept ANY POST path that contains "alert-config" so client path
+// differences (/alert-config, /api/alert-config, /v1/alert-config, etc.) still work.
+app.post(/.*alert-config.*/, (req, res) => {
   try {
+    console.log('[AlertService] Incoming', req.method, req.path);
+
     const { userId, currency, assets } = req.body || {};
     if (!userId || !Array.isArray(assets)) {
       return res
