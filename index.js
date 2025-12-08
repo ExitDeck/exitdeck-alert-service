@@ -16,10 +16,14 @@ if (!fetch) {
 }
 
 if (!ONESIGNAL_API_KEY) {
-  console.warn('[AlertService] WARNING: ONESIGNAL_API_KEY not set – pushes will be skipped');
+  console.warn(
+    '[AlertService] WARNING: ONESIGNAL_API_KEY not set – pushes will be skipped'
+  );
 }
 if (!ONESIGNAL_APP_ID) {
-  console.warn('[AlertService] WARNING: ONESIGNAL_APP_ID not set – pushes will be skipped');
+  console.warn(
+    '[AlertService] WARNING: ONESIGNAL_APP_ID not set – pushes will be skipped'
+  );
 }
 
 const app = express();
@@ -200,6 +204,18 @@ app.post(/.*alert-config.*/, (req, res) => {
   }
 });
 
+// Manual trigger endpoint for cron/uptime pingers
+app.post('/run-alert-scan', async (req, res) => {
+  try {
+    console.log('[AlertService] /run-alert-scan invoked');
+    await runAlertScan();
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[AlertService] /run-alert-scan error', err);
+    res.status(500).json({ ok: false });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`ExitDeck Alert Service listening on ${PORT}`);
   console.log('Your service is live');
@@ -337,8 +353,14 @@ async function runAlertScan() {
   try {
     const symbols = collectAllSymbols();
     if (!symbols.length) {
+      console.log('[AlertService] runAlertScan: no symbols to check');
       return;
     }
+
+    console.log(
+      '[AlertService] runAlertScan: checking symbols:',
+      symbols.join(',')
+    );
 
     const prices = await fetchPricesUSD(symbols);
 
@@ -358,8 +380,8 @@ async function runAlertScan() {
 
           if (distancePct <= alertWithin) {
             const key = alertKey(cfg.userId, sym, index);
+            // Throttle per user/symbol/tier for 60 minutes
             if (shouldThrottle(key, 60)) {
-              // Already alerted recently for this user/symbol/tier
               return;
             }
             sendOneSignalNotification({
