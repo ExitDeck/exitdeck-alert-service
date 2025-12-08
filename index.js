@@ -1,174 +1,280 @@
-import express from "express";
+// index.js – ExitDeck Alert Service (CoinGecko + OneSignal)
 
-// In Node 18+ fetch is built-in
+const express = require('express');
+const cors = require('cors');
+
+const PORT = process.env.PORT || 10000;
+const ONESIGNAL_API_KEY = process.env.ONESIGNAL_API_KEY;
+const ONESIGNAL_APP_ID = process.env.ONESIGNAL_APP_ID;
+
+// Fallback to node-fetch if global fetch is not available
+let fetchFn = global.fetch;
+if (!fetchFn) {
+  fetchFn = (...args) =>
+    import('node-fetch').then(({ default: f }) => f(...args));
+}
+const fetch = fetchFn;
+
+if (!ONESIGNAL_API_KEY) {
+  console.warn('[AlertService] WARNING: ONESIGNAL_API_KEY not set');
+}
+if (!ONESIGNAL_APP_ID) {
+  console.warn('[AlertService] WARNING: ONESIGNAL_APP_ID not set');
+}
+
 const app = express();
+app.use(cors());
 app.use(express.json());
 
-// In-memory config: userId -> { userId, currency, assets: [...] }
-const alertConfigs = new Map();
+// In-memory user configs and alert history
+const configsByUser = new Map();     // userId -> { userId, currency, assets[] }
+const lastAlertByKey = new Map();    // "user:symbol:tier" -> timestamp ms
 
-// Last notification timestamps: userId#symbol#tierIndex -> ms since epoch
-const lastNotified = new Map();
+// Supported symbols for price polling (CoinGecko IDs)
+const SYMBOL_TO_COINGECKO_ID = {
+  BTC: 'bitcoin',
+  ETH: 'ethereum',
+  XRP: 'ripple',
+  HBAR: 'hedera-hashgraph',
+  XLM: 'stellar',
+  FET: 'fetch-ai',
+  NEAR: 'near',
+  RNDR: 'render-token',
+  ONDO: 'ondo-finance',
+  AKT: 'akash-network'
+};
 
 // --- HTTP endpoints ---
 
-// iOS app calls this to update its tier config
-app.post("/api/update-alert-config", (req, res) => {
-  const cfg = req.body;
-
-  if (!cfg || !cfg.userId || !Array.isArray(cfg.assets)) {
-    return res.status(400).json({ error: "Invalid payload" });
-  }
-
-  alertConfigs.set(cfg.userId, cfg);
-  console.log("Updated config for", cfg.userId, "assets:", cfg.assets.length);
-  return res.json({ ok: true });
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ok',
+    users: configsByUser.size
+  });
 });
 
-// Optional manual trigger (for testing from browser)
-app.get("/internal/run-alerts", async (req, res) => {
+// Payload from app: { userId, currency, assets: [{ symbol, alertWithinPct, tiersUSD[] }] }
+app.post('/alert-config', (req, res) => {
   try {
-    await runAlertCheck();
+    const { userId, currency, assets } = req.body || {};
+    if (!userId || !Array.isArray(assets)) {
+      return res
+        .status(400)
+        .json({ ok: false, error: 'Invalid payload (userId/assets)' });
+    }
+
+    const normAssets = assets.map(a => ({
+      symbol: String(a.symbol || '').toUpperCase(),
+      alertWithinPct: Number(a.alertWithinPct || 0),
+      tiersUSD: Array.isArray(a.tiersUSD)
+        ? a.tiersUSD.map(n => Number(n) || 0)
+        : []
+    }));
+
+    configsByUser.set(userId, {
+      userId,
+      currency: currency || 'USD',
+      assets: normAssets
+    });
+
+    console.log(
+      '[AlertService] Updated config for',
+      userId,
+      'assets:',
+      normAssets.length
+    );
+
     res.json({ ok: true });
   } catch (err) {
-    console.error("runAlertCheck error", err);
-    res.status(500).json({ error: "runAlertCheck failed" });
+    console.error('[AlertService] /alert-config error', err);
+    res.status(500).json({ ok: false });
   }
 });
 
-const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log("ExitDeck Alert Service listening on", PORT);
-
-  // Run every 60 seconds
-  setInterval(() => {
-    runAlertCheck().catch((err) => console.error("interval error", err));
-  }, 60 * 1000);
+  console.log(`ExitDeck Alert Service listening on ${PORT}`);
+  console.log('Your service is live');
 });
 
-// --------------- Core logic ---------------
+// --- Alert engine helpers ---
 
-async function runAlertCheck() {
-  if (alertConfigs.size === 0) return;
-
-  const symbolsSet = new Set();
-  for (const cfg of alertConfigs.values()) {
-    cfg.assets.forEach((a) => symbolsSet.add(a.symbol.toUpperCase()));
-  }
-  const symbols = Array.from(symbolsSet);
-  if (symbols.length === 0) return;
-
-  const prices = await fetchPrices(symbols); // { XRP: 0.62, HBAR: 0.11, ... }
-  const now = Date.now();
-  const minNotifyMs = 30 * 60 * 1000; // 30 minutes per tier
-
-  for (const [userId, cfg] of alertConfigs.entries()) {
+function collectAllSymbols() {
+  const set = new Set();
+  for (const cfg of configsByUser.values()) {
     for (const asset of cfg.assets) {
-      const symbol = asset.symbol.toUpperCase();
-      const price = prices[symbol];
-      if (!price || price <= 0) continue;
-
-      const tiers = [asset.tier1, asset.tier2, asset.tier3];
-      const threshold = asset.thresholdPct > 0 ? asset.thresholdPct : 5;
-
-      tiers.forEach((target, idx) => {
-        if (!target || target <= 0) return;
-
-        const distancePct = Math.abs(price - target) / target * 100;
-        if (distancePct > threshold) return;
-
-        const tierIndex = idx + 1;
-        const key = `${userId}#${symbol}#${tierIndex}`;
-
-        const last = lastNotified.get(key);
-        if (last && now - last < minNotifyMs) {
-          return;
-        }
-
-        lastNotified.set(key, now);
-
-        const title = `Tier ${tierIndex} nearly hit for ${symbol}`;
-        const body = `Current: ${price.toFixed(4)} vs target ${target.toFixed(
-          4
-        )} (${distancePct.toFixed(1)}% away).`;
-
-        sendPushToUser(userId, title, body).catch((err) =>
-          console.error("sendPush error", err)
-        );
-      });
+      if (asset.symbol) set.add(asset.symbol);
     }
   }
+  return Array.from(set);
 }
 
-async function fetchPrices(symbols) {
-  // Map your tickers to CoinGecko IDs
-  const idMap = {
-    XRP: "ripple",
-    HBAR: "hedera-hashgraph",
-    XLM: "stellar",
-    FET: "fetch-ai",
-    NEAR: "near",
-    RNDR: "render-token",
-    ONDO: "ondo-finance",
-    AKT: "akash-network"
-  };
+async function fetchPricesUSD(symbols) {
+  const ids = [];
+  const symbolForId = {};
 
-  const ids = symbols
-    .map((s) => idMap[s])
-    .filter(Boolean)
-    .join(",");
+  for (const sym of symbols) {
+    const id = SYMBOL_TO_COINGECKO_ID[sym];
+    if (id) {
+      ids.push(id);
+      symbolForId[id] = sym;
+    }
+  }
 
-  if (!ids) return {};
+  if (!ids.length) return {};
 
-  const url = `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(
-    ids
-  )}&vs_currencies=usd`;
+  const url =
+    'https://api.coingecko.com/api/v3/simple/price?ids=' +
+    encodeURIComponent(ids.join(',')) +
+    '&vs_currencies=usd';
 
   const resp = await fetch(url);
   if (!resp.ok) {
-    console.error("Price fetch failed", resp.status);
-    return {};
+    throw new Error('CoinGecko error ' + resp.status);
   }
+  const json = await resp.json();
 
-  const data = await resp.json();
-
-  const result = {};
-  for (const [sym, id] of Object.entries(idMap)) {
-    if (data[id] && typeof data[id].usd === "number") {
-      result[sym] = data[id].usd;
+  const out = {};
+  for (const [id, v] of Object.entries(json)) {
+    const sym = symbolForId[id];
+    if (sym && v && typeof v.usd === 'number') {
+      out[sym] = v.usd;
     }
   }
-  return result;
+  return out;
 }
 
-async function sendPushToUser(userId, title, body) {
-  const apiKey = process.env.ONESIGNAL_API_KEY;
-  const appId = "9bc29b9e-76bf-48c9-95f4-5f5ffbedd8a9"; // your OneSignal App ID
+function alertKey(userId, symbol, tierIndex) {
+  return `${userId}:${symbol}:T${tierIndex}`;
+}
 
-  if (!appId || !apiKey) {
-    console.warn("OneSignal not configured; skipping push.");
+// Prevent spamming the same alert: default 60 minutes between identical alerts
+function shouldThrottle(key, minutes) {
+  const now = Date.now();
+  const last = lastAlertByKey.get(key) || 0;
+  const minMs = minutes * 60 * 1000;
+  if (now - last < minMs) return true;
+  lastAlertByKey.set(key, now);
+  return false;
+}
+
+async function sendOneSignalNotification({
+  userId,
+  symbol,
+  tierIndex,
+  priceUSD,
+  targetUSD,
+  distancePct
+}) {
+  if (!ONESIGNAL_API_KEY || !ONESIGNAL_APP_ID) {
+    console.warn('[AlertService] OneSignal not configured, skipping push');
     return;
   }
 
-  const url = "https://onesignal.com/api/v1/notifications";
+  const title = `Exit target near for ${symbol}`;
+  const body = `Price $${priceUSD.toFixed(
+    4
+  )} is within ${distancePct.toFixed(2)}% of Tier ${
+    tierIndex + 1
+  } ($${targetUSD.toFixed(4)}).`;
 
   const payload = {
-    app_id: appId,
+    app_id: ONESIGNAL_APP_ID,
     include_external_user_ids: [userId],
+    channel_for_external_user_ids: 'push',
     headings: { en: title },
-    contents: { en: body }
+    contents: { en: body },
+    data: {
+      kind: 'tier_alert',
+      symbol,
+      tierIndex,
+      priceUSD,
+      targetUSD,
+      distancePct
+    }
   };
 
-  const resp = await fetch(url, {
-    method: "POST",
+  const resp = await fetch('https://onesignal.com/api/v1/notifications', {
+    method: 'POST',
     headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      Authorization: `Basic ${apiKey}`
+      'Content-Type': 'application/json; charset=utf-8',
+      Authorization: `Basic ${ONESIGNAL_API_KEY}`
     },
     body: JSON.stringify(payload)
   });
 
   if (!resp.ok) {
-    console.error("OneSignal push failed:", resp.status, await resp.text());
+    const text = await resp.text().catch(() => '');
+    console.error(
+      '[AlertService] OneSignal error',
+      resp.status,
+      resp.statusText,
+      text
+    );
+  } else {
+    console.log(
+      '[AlertService] Push sent',
+      symbol,
+      'tier',
+      tierIndex + 1,
+      'user',
+      userId
+    );
   }
 }
+
+async function runAlertScan() {
+  try {
+    const symbols = collectAllSymbols();
+    if (!symbols.length) {
+      return;
+    }
+
+    const prices = await fetchPricesUSD(symbols);
+
+    for (const cfg of configsByUser.values()) {
+      for (const asset of cfg.assets) {
+        const sym = asset.symbol;
+        const priceUSD = prices[sym];
+        if (!priceUSD || !Array.isArray(asset.tiersUSD)) continue;
+
+        const alertWithin = Math.max(1, asset.alertWithinPct || 0);
+
+        asset.tiersUSD.forEach((tierUSD, index) => {
+          if (!tierUSD || tierUSD <= 0) return;
+
+          const distancePct =
+            Math.abs(priceUSD - tierUSD) / tierUSD * 100;
+
+          if (distancePct <= alertWithin) {
+            const key = alertKey(cfg.userId, sym, index);
+            if (shouldThrottle(key, 60)) {
+              // Already alerted recently for this user/symbol/tier
+              return;
+            }
+            sendOneSignalNotification({
+              userId: cfg.userId,
+              symbol: sym,
+              tierIndex: index,
+              priceUSD,
+              targetUSD: tierUSD,
+              distancePct
+            }).catch(err =>
+              console.error(
+                '[AlertService] sendOneSignalNotification failed',
+                err
+              )
+            );
+          }
+        });
+      }
+    }
+  } catch (err) {
+    console.error('[AlertService] runAlertScan error', err);
+  }
+}
+
+// Run every 5 minutes
+setInterval(runAlertScan, 5 * 60 * 1000);
+
+// Also run once shortly after boot
+setTimeout(runAlertScan, 30 * 1000);
