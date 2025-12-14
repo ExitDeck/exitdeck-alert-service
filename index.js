@@ -220,9 +220,12 @@ app.post(/.*alert-config.*/, (req, res) => {
 });
 
 // Manual trigger endpoint for cron/uptime pingers
-app.post('/run-alert-scan', async (req, res) => {
+app.all('/run-alert-scan', async (req, res) => {
   try {
-    console.log('[AlertService] /run-alert-scan invoked');
+    console.log(
+      '[AlertService] /run-alert-scan invoked via',
+      req.method || 'GET'
+    );
     await runAlertScan();
     res.json({ ok: true });
   } catch (err) {
