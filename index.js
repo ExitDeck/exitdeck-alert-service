@@ -3,16 +3,31 @@
 const express = require('express');
 const cors = require('cors');
 
-const PORT = process.env.PORT || 10000;
+const PORT = Number(process.env.PORT) || 10000;
+const HOST = '0.0.0.0';
+
 const ONESIGNAL_API_KEY = process.env.ONESIGNAL_API_KEY || '';
 const ONESIGNAL_APP_ID = process.env.ONESIGNAL_APP_ID || '';
 
-// Require Node 18+ so global.fetch exists
-const fetch = global.fetch;
-if (!fetch) {
-  throw new Error(
-    '[AlertService] global.fetch is not available – use Node 18+ on Render'
+// --- Fetch setup ----------------------------------------------------
+
+// Prefer Node's built-in global fetch if available, but NEVER crash if it isn’t.
+// If fetch is missing, we provide a stub that will cause scan errors to be
+// logged (inside runAlertScan's try/catch) without killing the process.
+let fetchFn = global.fetch;
+
+if (!fetchFn) {
+  console.warn(
+    '[AlertService] WARNING: global.fetch is not available. ' +
+      'CoinGecko calls will fail until Node >=18 or a fetch polyfill is added.'
   );
+
+  fetchFn = async () => {
+    throw new Error(
+      '[AlertService] fetch is not available in this runtime. ' +
+        'Configure Node 18+ or add a fetch polyfill (e.g. node-fetch).'
+    );
+  };
 }
 
 if (!ONESIGNAL_API_KEY) {
@@ -61,7 +76,7 @@ async function ensureCoinListLoaded() {
   const now = Date.now();
   if (cgListCache && now - cgListLastFetched < CG_LIST_TTL_MS) return;
 
-  const resp = await fetch(
+  const resp = await fetchFn(
     'https://api.coingecko.com/api/v3/coins/list?include_platform=false'
   );
   if (!resp.ok) {
@@ -216,8 +231,8 @@ app.post('/run-alert-scan', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`ExitDeck Alert Service listening on ${PORT}`);
+app.listen(PORT, HOST, () => {
+  console.log(`ExitDeck Alert Service listening on ${HOST}:${PORT}`);
   console.log('Your service is live');
 });
 
@@ -254,7 +269,7 @@ async function fetchPricesUSD(symbols) {
     encodeURIComponent(ids.join(',')) +
     '&vs_currencies=usd';
 
-  const resp = await fetch(url);
+  const resp = await fetchFn(url);
   if (!resp.ok) {
     throw new Error('CoinGecko error ' + resp.status);
   }
@@ -320,7 +335,7 @@ async function sendOneSignalNotification({
     },
   };
 
-  const resp = await fetch('https://onesignal.com/api/v1/notifications', {
+  const resp = await fetchFn('https://onesignal.com/api/v1/notifications', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json; charset=utf-8',
